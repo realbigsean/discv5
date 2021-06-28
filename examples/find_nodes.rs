@@ -1,6 +1,6 @@
 //! Demonstrates how to run a basic Discovery v5 Service.
 //!
-//! This example creates a discv5 service which searches for peers every 30 seconds. On
+//! This example creates a discv5 service which searches for peers every 60 seconds. On
 //! creation, the local ENR created for this service is displayed in base64. This can be used to
 //! allow other instances to connect and join the network. The service can be stopped by pressing
 //! Ctrl-C.
@@ -9,7 +9,7 @@
 //! participating node in the command line. The nodes should discover each other over a period of
 //! time. (It is probabilistic that nodes to find each other on any given query).
 //!
-//! A single instance listening on a UDP socket `127.0.0.1:9000` (with an ENR that has an empty IP
+//! A single instance listening on a UDP socket `0.0.0.0:9000` (with an ENR that has an empty IP
 //! and UDP port) can be created via:
 //!
 //! ```
@@ -25,8 +25,9 @@
 //! ```
 //! sh cargo run --example find_nodes -- 127.0.0.1 9001 <GENERATE_KEY> <BASE64_ENR>
 //! ```
-//!
-//! where `<BASE64_ENR>` is the base64 ENR given from executing the first node with an IP and port
+//! Here `127.0.0.1` represents the external IP address that others may connect to this node on. The
+//! `9001` represents the external port and the port to listen on. The `<BASE64_ENR>` is the base64
+//! ENR given from executing the first node with an IP and port
 //! given in the CLI.
 //! `<GENERATE_KEY>` is a boolean (`true` or `false`) specifying if a new key should be generated.
 //! These steps can be repeated to add further nodes to the test network.
@@ -35,9 +36,7 @@
 //!
 //!  For a simple CLI discovery service see [discv5-cli](https://github.com/AgeManning/discv5-cli)
 
-use discv5::{enr, enr::CombinedKey, Discv5, Discv5Config, Discv5Event};
-use futures::prelude::*;
-use hex_literal::*;
+use discv5::{enr, enr::CombinedKey, Discv5, Discv5ConfigBuilder};
 use std::{
     net::{Ipv4Addr, SocketAddr},
     time::Duration,
@@ -45,16 +44,17 @@ use std::{
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
+        .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))
+        .unwrap();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter_layer)
+        .try_init();
 
     // if there is an address specified use it
-    let address = {
-        if let Some(address) = std::env::args().nth(1) {
-            address.parse::<Ipv4Addr>().unwrap()
-        } else {
-            Ipv4Addr::new(127, 0, 0, 1)
-        }
-    };
+    let address = std::env::args()
+        .nth(1)
+        .map(|addr| addr.parse::<Ipv4Addr>().unwrap());
 
     let port = {
         if let Some(udp_port) = std::env::args().nth(2) {
@@ -65,8 +65,9 @@ async fn main() {
     };
 
     // A fixed key for testing
-    let raw_key = hex!("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291");
-    let secret_key = secp256k1::SecretKey::parse_slice(&raw_key).unwrap();
+    let raw_key =
+        hex::decode("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291").unwrap();
+    let secret_key = k256::ecdsa::SigningKey::from_bytes(&raw_key).unwrap();
     let mut enr_key = CombinedKey::from(secret_key);
 
     // use a random key if specified
@@ -80,8 +81,8 @@ async fn main() {
     let enr = {
         let mut builder = enr::EnrBuilder::new("v4");
         // if an IP was specified, use it
-        if std::env::args().nth(1).is_some() {
-            builder.ip(address.into());
+        if let Some(external_address) = address {
+            builder.ip(external_address.into());
         }
         // if a port was specified, use it
         if std::env::args().nth(2).is_some() {
@@ -99,14 +100,16 @@ async fn main() {
         println!("ENR is not printed as no IP:PORT was specified");
     }
 
-    // default configuration
-    let config = Discv5Config::default();
+    // default configuration with packet filtering
+    // let config = Discv5ConfigBuilder::new().enable_packet_filter().build();
+    // default configuration without packet filtering
+    let config = Discv5ConfigBuilder::new().build();
 
     // the address to listen on
-    let socket_addr = SocketAddr::new(address.into(), port);
+    let socket_addr = SocketAddr::new("0.0.0.0".parse().expect("valid ip"), port);
 
-    // construct the discv5 service, initializing an unused transport layer
-    let mut discv5 = Discv5::new(enr, enr_key, config, socket_addr).unwrap();
+    // construct the discv5 server
+    let mut discv5 = Discv5::new(enr, enr_key, config).unwrap();
 
     // if we know of another peer's ENR, add it known peers
     if let Some(base64_enr) = std::env::args().nth(4) {
@@ -125,29 +128,38 @@ async fn main() {
             Err(e) => panic!("Decoding ENR failed: {}", e),
         }
     }
+
+    // start the discv5 service
+    discv5.start(socket_addr).await.unwrap();
+
     // construct a 30 second interval to search for new peers.
-    let mut query_interval = tokio::time::interval(Duration::from_secs(30));
+    let mut query_interval = tokio::time::interval(Duration::from_secs(60));
 
     loop {
         tokio::select! {
-            _ = query_interval.next() => {
+            _ = query_interval.tick() => {
                 // pick a random node target
                 let target_random_node_id = enr::NodeId::random();
-                println!("Connected Peers: {}", discv5.connected_peers());
+                // get metrics
+                let metrics = discv5.metrics();
+                let connected_peers = discv5.connected_peers();
+                println!("Connected peers: {}, Active sessions: {}, Unsolicited requests/s: {:.2}", connected_peers, metrics.active_sessions, metrics.unsolicited_requests_per_second);
+                if !metrics.requests_per_ip_per_second.is_empty() {
+                    println!("Requests/s per IP:");
+                    for (ip, requests) in metrics.requests_per_ip_per_second.iter() {
+                        println!("IP: {:?} R/s: {:.2}", ip, requests);
+                    }
+                }
                 println!("Searching for peers...");
                 // execute a FINDNODE query
-                discv5.find_node(target_random_node_id);
-            }
-            event = discv5.next() => {
-                if let Some(event) = event {
-                    if let Discv5Event::FindNodeResult { closer_peers, .. } = event {
-                        if !closer_peers.is_empty() {
-                            println!("Query Completed. Nodes found:");
-                            for n in closer_peers {
-                                println!("Node: {}", n);
-                            }
-                        } else {
-                            println!("Query Completed. No peers found.")
+                match discv5.find_node(target_random_node_id).await {
+                    Err(e) => println!("Find Node result failed: {:?}", e),
+                    Ok(v) => {
+                        // found a list of ENR's print their NodeIds
+                        let node_ids = v.iter().map(|enr| enr.node_id()).collect::<Vec<_>>();
+                        println!("Nodes found: {}", node_ids.len());
+                        for node_id in node_ids {
+                            println!("Node: {}", node_id);
                         }
                     }
                 }

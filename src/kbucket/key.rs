@@ -21,14 +21,16 @@
 // This basis of this file has been taken from the rust-libp2p codebase:
 // https://github.com/libp2p/rust-libp2p
 
-use bigint::U256;
+#![allow(clippy::all)]
+
 use enr::NodeId;
-//use libp2p_core::PeerId;
-//use multihash::Multihash;
-use sha2::{
-    digest::generic_array::{typenum::U32, GenericArray},
-    Digest, Sha256,
-};
+use sha2::digest::generic_array::{typenum::U32, GenericArray};
+use uint::construct_uint;
+
+construct_uint! {
+    /// 256-bit unsigned integer.
+    pub(super) struct U256(4);
+}
 
 /// A `Key` is a cryptographic hash, identifying both the nodes participating in
 /// the Kademlia DHT, as well as records stored in the DHT.
@@ -60,18 +62,6 @@ impl<TPeerId> AsRef<Key<TPeerId>> for Key<TPeerId> {
 }
 
 impl<T> Key<T> {
-    /// Construct a new `Key` by hashing the bytes of the given `preimage`.
-    ///
-    /// The preimage of type `T` is preserved. See [`Key::preimage`] and
-    /// [`Key::into_preimage`].
-    pub fn _new(preimage: T) -> Key<T>
-    where
-        T: AsRef<[u8]>,
-    {
-        let hash = Sha256::digest(preimage.as_ref());
-        Key { preimage, hash }
-    }
-
     /// Construct a new `Key` by providing the raw 32 byte hash.
     pub fn new_raw(preimage: T, hash: GenericArray<u8, U32>) -> Key<T> {
         Key { preimage, hash }
@@ -89,8 +79,8 @@ impl<T> Key<T> {
 
     /// Computes the distance of the keys according to the XOR metric.
     pub fn distance<U>(&self, other: &Key<U>) -> Distance {
-        let a = U256::from(self.hash.as_ref());
-        let b = U256::from(other.hash.as_ref());
+        let a = U256::from(self.hash.as_slice());
+        let b = U256::from(other.hash.as_slice());
         Distance(a ^ b)
     }
 
@@ -119,7 +109,7 @@ impl From<NodeId> for Key<NodeId> {
 
 /// A distance between two `Key`s.
 #[derive(Copy, Clone, PartialEq, Eq, Default, PartialOrd, Ord, Debug)]
-pub struct Distance(pub(super) bigint::U256);
+pub struct Distance(pub(super) U256);
 
 #[cfg(test)]
 mod tests {

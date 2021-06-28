@@ -23,13 +23,19 @@
 
 mod peers;
 
-pub(crate) use peers::closest::{FindNodeQuery, FindNodeQueryConfig};
-pub(crate) use peers::predicate::{PredicateQuery, PredicateQueryConfig};
-pub use peers::{QueryState, ReturnPeer};
+pub use peers::QueryState;
+pub(crate) use peers::{
+    closest::{FindNodeQuery, FindNodeQueryConfig},
+    predicate::{PredicateQuery, PredicateQueryConfig},
+};
 
 use crate::kbucket::{Key, PredicateKey};
 use fnv::FnvHashMap;
 use std::time::{Duration, Instant};
+
+pub trait TargetKey<TNodeId> {
+    fn key(&self) -> Key<TNodeId>;
+}
 
 /// A `QueryPool` provides an aggregate state machine for driving `Query`s to completion.
 ///
@@ -49,12 +55,7 @@ pub enum QueryPoolState<'a, TTarget, TNodeId, TResult> {
     Idle,
     /// At least one query is waiting for results. `Some(request)` indicates
     /// that a new request is now being waited on.
-    Waiting(
-        Option<(
-            &'a mut Query<TTarget, TNodeId, TResult>,
-            ReturnPeer<TNodeId>,
-        )>,
-    ),
+    Waiting(Option<(&'a mut Query<TTarget, TNodeId, TResult>, TNodeId)>),
     /// A query has finished.
     Finished(Query<TTarget, TNodeId, TResult>),
     /// A query has timed out.
@@ -63,7 +64,7 @@ pub enum QueryPoolState<'a, TTarget, TNodeId, TResult> {
 
 impl<TTarget, TNodeId, TResult> QueryPool<TTarget, TNodeId, TResult>
 where
-    TTarget: Into<Key<TTarget>> + Clone,
+    TTarget: TargetKey<TNodeId>,
     TNodeId: Into<Key<TNodeId>> + Eq + Clone,
     TResult: Into<TNodeId> + Clone,
 {
@@ -87,12 +88,12 @@ where
         config: FindNodeQueryConfig,
         target: TTarget,
         peers: I,
-        iterations: usize,
     ) -> QueryId
     where
         I: IntoIterator<Item = Key<TNodeId>>,
     {
-        let findnode_query = FindNodeQuery::with_config(config, target.clone(), peers, iterations);
+        let target_key = target.key();
+        let findnode_query = FindNodeQuery::with_config(config, target_key, peers);
         let peer_iter = QueryPeerIter::FindNode(findnode_query);
         self.add(peer_iter, target)
     }
@@ -103,23 +104,18 @@ where
         config: PredicateQueryConfig,
         target: TTarget,
         peers: I,
-        iterations: usize,
         predicate: impl Fn(&TResult) -> bool + Send + 'static,
     ) -> QueryId
     where
         I: IntoIterator<Item = PredicateKey<TNodeId>>,
     {
-        let predicate_query =
-            PredicateQuery::with_config(config, target.clone(), peers, iterations, predicate);
+        let target_key = target.key();
+        let predicate_query = PredicateQuery::with_config(config, target_key, peers, predicate);
         let peer_iter = QueryPeerIter::Predicate(predicate_query);
         self.add(peer_iter, target)
     }
 
-    fn add(
-        &mut self,
-        peer_iter: QueryPeerIter<TTarget, TNodeId, TResult>,
-        target: TTarget,
-    ) -> QueryId {
+    fn add(&mut self, peer_iter: QueryPeerIter<TNodeId, TResult>, target: TTarget) -> QueryId {
         let id = QueryId(self.next_id);
         self.next_id = self.next_id.wrapping_add(1);
         let query = Query::new(id, peer_iter, target);
@@ -187,12 +183,19 @@ where
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct QueryId(pub usize);
 
+impl std::ops::Deref for QueryId {
+    type Target = usize;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// A query in a `QueryPool`.
 pub struct Query<TTarget, TNodeId, TResult> {
     /// The unique ID of the query.
     id: QueryId,
     /// The peer iterator that drives the query state.
-    peer_iter: QueryPeerIter<TTarget, TNodeId, TResult>,
+    peer_iter: QueryPeerIter<TNodeId, TResult>,
     /// The instant when the query started (i.e. began waiting for the first
     /// result from a peer).
     started: Option<Instant>,
@@ -201,23 +204,19 @@ pub struct Query<TTarget, TNodeId, TResult> {
 }
 
 /// The peer selection strategies that can be used by queries.
-enum QueryPeerIter<TTarget, TNodeId, TResult> {
-    FindNode(FindNodeQuery<TTarget, TNodeId>),
-    Predicate(PredicateQuery<TTarget, TNodeId, TResult>),
+enum QueryPeerIter<TNodeId, TResult> {
+    FindNode(FindNodeQuery<TNodeId>),
+    Predicate(PredicateQuery<TNodeId, TResult>),
 }
 
 impl<TTarget, TNodeId, TResult> Query<TTarget, TNodeId, TResult>
 where
-    TTarget: Into<Key<TTarget>> + Clone,
+    TTarget: TargetKey<TNodeId>,
     TNodeId: Into<Key<TNodeId>> + Eq + Clone,
     TResult: Into<TNodeId> + Clone,
 {
     /// Creates a new query without starting it.
-    fn new(
-        id: QueryId,
-        peer_iter: QueryPeerIter<TTarget, TNodeId, TResult>,
-        target: TTarget,
-    ) -> Self {
+    fn new(id: QueryId, peer_iter: QueryPeerIter<TNodeId, TResult>, target: TTarget) -> Self {
         Query {
             id,
             peer_iter,

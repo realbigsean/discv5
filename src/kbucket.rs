@@ -76,10 +76,13 @@ mod key;
 
 pub use entry::*;
 
+use crate::Enr;
 use arrayvec::{self, ArrayVec};
 use bucket::KBucket;
-use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 /// Maximum number of k-buckets.
 const NUM_BUCKETS: usize = 256;
@@ -162,6 +165,20 @@ where
         }
     }
 
+    /// Removes a node from the routing table. Returns `true` of the node existed.
+    pub fn remove(&mut self, key: &Key<TNodeId>) -> bool {
+        let index = BucketIndex::new(&self.local_key.distance(key));
+        if let Some(i) = index {
+            let bucket = &mut self.buckets[i.get()];
+            if let Some(applied) = bucket.apply_pending() {
+                self.applied_pending.push_back(applied)
+            }
+            bucket.remove(key)
+        } else {
+            false
+        }
+    }
+
     /// Returns an `Entry` for the given key, representing the state of the entry
     /// in the routing table.
     pub fn entry<'a>(&'a mut self, key: &'a Key<TNodeId>) -> Entry<'a, TNodeId, TVal> {
@@ -226,30 +243,47 @@ where
     }
 
     /// Returns an iterator over the keys that are contained in a kbucket, specified by a log2 distance.
-    pub fn nodes_by_distance<'a>(
+    pub fn nodes_by_distances<'a>(
         &'a mut self,
-        log2_distance: u64,
+        log2_distances: Vec<u64>,
+        max_nodes: usize,
     ) -> Vec<EntryRefView<'a, TNodeId, TVal>> {
-        // the log2 distance ranges from 1-256 and is always 1 more than the bucket index. For this
-        // reason we subtract 1 from log2 distance to get the correct bucket index.
-        if log2_distance > 0 && log2_distance <= (NUM_BUCKETS as u64) {
-            let bucket = &mut self.buckets[(log2_distance - 1) as usize];
+        let distances = log2_distances
+            .into_iter()
+            .filter(|&d| d > 0 && d <= (NUM_BUCKETS as u64))
+            .collect::<Vec<_>>();
+
+        // apply bending nodes
+        for distance in &distances {
+            // the log2 distance ranges from 1-256 and is always 1 more than the bucket index. For this
+            // reason we subtract 1 from log2 distance to get the correct bucket index.
+            let bucket = &mut self.buckets[(distance - 1) as usize];
             if let Some(applied) = bucket.apply_pending() {
                 self.applied_pending.push_back(applied)
             }
-            bucket
-                .iter()
-                .map(|(n, status)| {
-                    let node = NodeRefView {
-                        key: &n.key,
-                        value: &n.value,
-                    };
-                    EntryRefView { node, status }
-                })
-                .collect()
-        } else {
-            Vec::new()
         }
+
+        // find the matching nodes
+        let mut matching_nodes = Vec::new();
+
+        // Note we search via distance in order
+        for distance in distances {
+            let bucket = &self.buckets[(distance - 1) as usize];
+            for node in bucket.iter().map(|(n, status)| {
+                let node = NodeRefView {
+                    key: &n.key,
+                    value: &n.value,
+                };
+                EntryRefView { node, status }
+            }) {
+                matching_nodes.push(node);
+                // Exit early if we have found enough nodes
+                if matching_nodes.len() >= max_nodes {
+                    return matching_nodes;
+                }
+            }
+        }
+        matching_nodes
     }
 
     /// Returns an iterator over the keys closest to `target`, ordered by
@@ -608,4 +642,25 @@ mod tests {
         assert_eq!(Some(expected_applied), table.take_applied_pending());
         assert_eq!(None, table.take_applied_pending());
     }
+}
+
+/// Takes an `ENR` to insert and a list of other `ENR`s to compare against.
+/// Returns `true` if `ENR` can be inserted and `false` otherwise.
+/// `enr` can be inserted if the count of enrs in `others` in the same /24 subnet as `ENR`
+/// is less than `limit`.
+pub fn ip_limiter(enr: &Enr, others: &[&Enr], limit: usize) -> bool {
+    let mut allowed = true;
+    if let Some(ip) = enr.ip() {
+        let count = others.iter().flat_map(|e| e.ip()).fold(0, |acc, x| {
+            if x.octets()[0..3] == ip.octets()[0..3] {
+                acc + 1
+            } else {
+                acc
+            }
+        });
+        if count >= limit {
+            allowed = false;
+        }
+    };
+    allowed
 }
